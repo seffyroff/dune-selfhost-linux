@@ -209,7 +209,10 @@ install_packages() {
       apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq tar iproute2 sudo procps
       if ! command -v steamcmd >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd || install_steamcmd_tarball
+        DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd || {
+          install_steamcmd_apt_runtime
+          install_steamcmd_tarball
+        }
       fi
       ;;
     dnf)
@@ -235,6 +238,23 @@ install_packages() {
       install_steamcmd_tarball
       ;;
   esac
+}
+
+install_steamcmd_apt_runtime() {
+  if dpkg --print-foreign-architectures | grep -qx i386; then
+    :
+  else
+    dpkg --add-architecture i386
+    apt-get update
+  fi
+
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    libc6:i386 \
+    libstdc++6:i386 \
+    libgcc-s1:i386 \
+    zlib1g:i386
+  DEBIAN_FRONTEND=noninteractive apt-get install -y libcurl4t64:i386 ||
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libcurl4:i386
 }
 
 install_steamcmd_tarball() {
@@ -596,6 +616,14 @@ run_as_dune() {
     "$@"
 }
 
+run_bash_as_dune() {
+  sudo -u "${DUNE_USER}" -H env \
+    HOME="${DUNE_HOME}" \
+    PATH="${HOST_USR_LOCAL}/bin:/usr/local/bin:/usr/bin:/bin:${DUNE_ROOT}/bin" \
+    KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml" \
+    bash "$@"
+}
+
 prepare_vendor_scripts() {
   chmod +x "${DOWNLOAD_PATH}/scripts/setup.sh" \
     "${DOWNLOAD_PATH}/scripts/setup/k3s.sh" \
@@ -618,7 +646,7 @@ run_vendor_core_setup() {
   install_openrc_compat_wrappers
 
   log "Running vendor k3s/image/operator setup"
-  run_as_dune "${DOWNLOAD_PATH}/scripts/setup/k3s.sh"
+  run_bash_as_dune "${DOWNLOAD_PATH}/scripts/setup/k3s.sh"
   link_vendor_tools
 }
 
@@ -658,10 +686,10 @@ run_vendor_world_setup() {
     region_choice="$(world_region_selection "${SETUP_WORLD_REGION}")"
     log "Creating Dune world '${SETUP_WORLD_NAME}' in ${SETUP_WORLD_REGION}"
     printf '%s\n%s\n%s\n' "${SETUP_WORLD_NAME}" "${region_choice}" "${SETUP_SELF_HOSTED_TOKEN}" |
-      run_as_dune "${DOWNLOAD_PATH}/scripts/setup/world.sh"
+      run_bash_as_dune "${DOWNLOAD_PATH}/scripts/setup/world.sh"
   elif [ -t 0 ]; then
     log "Running interactive world setup"
-    run_as_dune "${DOWNLOAD_PATH}/scripts/setup/world.sh"
+    run_bash_as_dune "${DOWNLOAD_PATH}/scripts/setup/world.sh"
   else
     die "World creation requires --world-name, --world-region, and --self-hosted-token/--self-hosted-token-file, or an interactive terminal."
   fi
@@ -1132,9 +1160,9 @@ run_battlegroup() {
   as_root test -x "${DUNE_ROOT}/bin/battlegroup" || as_root test -x "${DOWNLOAD_PATH}/scripts/battlegroup.sh" || die "Battlegroup tools not found. Run setup first."
   as_root systemctl start k3s
   if as_root test -x "${DUNE_ROOT}/bin/battlegroup"; then
-    as_root sudo -u "${DUNE_USER}" -H env HOME="${DUNE_HOME}" PATH="${HOST_USR_LOCAL}/bin:/usr/local/bin:/usr/bin:/bin:${DUNE_ROOT}/bin" KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml" "${DUNE_ROOT}/bin/battlegroup" "${cmd}" "$@"
+    as_root sudo -u "${DUNE_USER}" -H env HOME="${DUNE_HOME}" PATH="${HOST_USR_LOCAL}/bin:/usr/local/bin:/usr/bin:/bin:${DUNE_ROOT}/bin" KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml" bash "${DUNE_ROOT}/bin/battlegroup" "${cmd}" "$@"
   else
-    as_root sudo -u "${DUNE_USER}" -H env HOME="${DUNE_HOME}" PATH="${HOST_USR_LOCAL}/bin:/usr/local/bin:/usr/bin:/bin:${DUNE_ROOT}/bin" KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml" "${DOWNLOAD_PATH}/scripts/battlegroup.sh" "${cmd}" "$@"
+    as_root sudo -u "${DUNE_USER}" -H env HOME="${DUNE_HOME}" PATH="${HOST_USR_LOCAL}/bin:/usr/local/bin:/usr/bin:/bin:${DUNE_ROOT}/bin" KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml" bash "${DOWNLOAD_PATH}/scripts/battlegroup.sh" "${cmd}" "$@"
   fi
 }
 
