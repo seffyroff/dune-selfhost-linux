@@ -1,0 +1,68 @@
+# Local/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Shipped Hyper-V VM payloads and large local images
+Virtual Hard Disks/
+Virtual Machines/
+*.vhd
+*.vhdx
+*.avhdx
+*.vmcx
+*.vmrs
+*.vmgs
+
+# Funcom/Steam-distributed server package files.
+# The repo should contain only our native Linux tooling, docs, and tests.
+battlegroup.bat
+battlegroup-management/
+Engine/
+DuneSandbox/
+steamapps/
+Manifest_*.txt
+*.acf
+
+# Local Kubernetes/runtime state
+.kube/
+kubeconfig*
+*.kubeconfig
+
+# Dune generated secrets, world specs, and backups
+sh-*.yaml
+*-secret.yaml
+*.backup
+*.backup.yaml
+*.dump
+*.sql
+*.pgdump
+*.tar
+*.tar.gz
+*.tgz
+
+# Local env/config material that may contain secrets or host-specific paths
+.env
+.env.*
+*.env
+*.token
+*token*
+*secret*
+secrets/
+tokens/
+
+# Logs and generated reports
+*.log
+logs/
+test-results/
+coverage/
