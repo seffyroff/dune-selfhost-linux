@@ -2836,15 +2836,14 @@ doctor_check_battlegroup() {
     doctor_warn "no database backups found in ${backups}; run: $0 backup"
   fi
 
-  local bgd_pod declare_total declare_empty declare_populated
+  local bgd_pod declare_total declare_empty declare_populated bgd_logs
   bgd_pod="$(run_kubectl get pods -n "${ns}" -l role=igw-battlegroup-director \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   if [ -n "${bgd_pod}" ]; then
-    declare_total="$(run_kubectl logs -n "${ns}" "${bgd_pod}" 2>/dev/null \
-      | grep -c "DeclareBattlegroupUpdates" || echo 0)"
-    declare_empty="$(run_kubectl logs -n "${ns}" "${bgd_pod}" 2>/dev/null \
-      | grep "DeclareBattlegroupUpdates" \
-      | grep -c 'UpDeclarationsByPartitionId":{}' || echo 0)"
+    bgd_logs="$(run_kubectl logs -n "${ns}" "${bgd_pod}" 2>/dev/null)" || bgd_logs=""
+    declare_total=$(printf '%s\n' "${bgd_logs}" | grep -c "DeclareBattlegroupUpdates") || declare_total=0
+    declare_empty=$(printf '%s\n' "${bgd_logs}" | grep "DeclareBattlegroupUpdates" \
+      | grep -c 'UpDeclarationsByPartitionId":{}') || declare_empty=0
     declare_populated=$(( declare_total - declare_empty ))
     if [ "${declare_populated}" -gt 0 ]; then
       doctor_ok "BGD has fired ${declare_populated} populated DeclareBattlegroupUpdates — server should be visible in browser"
