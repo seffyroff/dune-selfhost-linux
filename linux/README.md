@@ -225,6 +225,7 @@ All flags are optional; only the ones you pass are changed. Common options:
 | `--always-on-sietches` | Keep sietch hubs always-running |
 | `--mining-multiplier FLOAT` | `Dune.GlobalMiningOutputMultiplier` in `UserEngine.ini` |
 | `--server-password PASS` | Join password (`Bgd.ServerLoginPassword`); pass empty string to remove |
+| `--farm-region REGION` | Server browser region (Europe, North America, Asia, Oceania, South America); patches `-FarmRegion` in the BattleGroup spec via targeted JSON patch |
 | `--no-stop` | Apply without stopping/restarting the battlegroup |
 
 The command stops the battlegroup, patches the BattleGroup CR and the

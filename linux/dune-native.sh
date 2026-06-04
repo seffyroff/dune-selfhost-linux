@@ -164,6 +164,7 @@ Environment:
   DUNE_MEM_SIETCH       Sietch hub memory limit for apply-canonical
   DUNE_MINING_MULTIPLIER Mining output multiplier for apply-canonical
   DUNE_SERVER_PASSWORD  Join password for apply-canonical
+  DUNE_FARM_REGION      Server browser region for apply-canonical
   DUNE_MANAGER_PORT     Manager service HTTP port. Default: 29187
   DUNE_MANAGER_TIMEZONE Manager service timezone. Default: Europe/London
   DUNE_ADMIN_ALLOWED_CIDRS
@@ -1977,6 +1978,7 @@ apply_canonical() {
   local always_on_sietches="${DUNE_ALWAYS_ON_SIETCHES:-0}"
   local mining_multiplier="${DUNE_MINING_MULTIPLIER:-}"
   local server_password="${DUNE_SERVER_PASSWORD:-}"
+  local farm_region="${DUNE_FARM_REGION:-}"
   local no_stop=0
 
   while [ "$#" -gt 0 ]; do
@@ -1991,6 +1993,7 @@ apply_canonical() {
       --always-on-sietches) always_on_sietches=1; shift ;;
       --mining-multiplier) mining_multiplier="${2:-}"; shift 2 ;;
       --server-password) server_password="${2:-}"; shift 2 ;;
+      --farm-region) farm_region="${2:-}"; shift 2 ;;
       --no-stop) no_stop=1; shift ;;
       --yes|-y) ASSUME_YES=1; shift ;;
       --help|-h)
@@ -2005,6 +2008,7 @@ apply_canonical() {
         printf '  --always-on-sietches       Set SH_Arrakeen + SH_HarkoVillage to always-on\n'
         printf '  --mining-multiplier FLOAT  GlobalMiningOutputMultiplier (e.g. 1.5)\n'
         printf '  --server-password PASS     Join password (empty string clears it)\n'
+        printf '  --farm-region REGION       Server browser region: Europe, North America, Asia, Oceania, South America\n'
         printf '  --no-stop                  Do not stop/start battlegroup around changes\n'
         return 0
         ;;
@@ -2079,6 +2083,31 @@ apply_canonical() {
     log "Clearing server login password from UserEngine.ini"
     as_root sed -i '/^Bgd\.ServerLoginPassword=/d' "${usersettings}/UserEngine.ini"
     ok "Cleared Bgd.ServerLoginPassword"
+  fi
+
+  if [ -n "${farm_region}" ]; then
+    log "Patching -FarmRegion to ${farm_region} in BattleGroup spec"
+    local farm_patch
+    farm_patch="$(run_kubectl get igwbg -n "${ns}" "${bg}" -o json |
+      jq -r --arg r "${farm_region}" '
+        [
+          .spec.serverGroup.template.spec.sets | to_entries[] |
+          . as $set |
+          (.value.extraArgs // []) | to_entries[] |
+          select(.value | test("-FarmRegion=")) |
+          {
+            op: "replace",
+            path: ("/spec/serverGroup/template/spec/sets/" + ($set.key | tostring) + "/extraArgs/" + (.key | tostring)),
+            value: ("-FarmRegion=" + $r)
+          }
+        ]
+      ')"
+    if [ "$(printf '%s' "${farm_patch}" | jq 'length')" -eq 0 ]; then
+      warn "No -FarmRegion entries found in BattleGroup spec; skipping"
+    else
+      run_kubectl patch igwbg -n "${ns}" "${bg}" --type=json -p="${farm_patch}"
+      ok "Patched -FarmRegion=${farm_region} in BattleGroup spec"
+    fi
   fi
 
   if [ -n "${pvp_partition}" ]; then
