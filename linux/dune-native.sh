@@ -2142,11 +2142,12 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$
 EnvironmentFile=-${MANAGER_SERVICE_ENV}
 Restart=on-failure
 RestartSec=10
-ReadWritePaths=${DUNE_HOME}/.dune ${DUNE_HOME}/.local /tmp
+ReadWritePaths=${DUNE_HOME}/.dune -${DUNE_HOME}/.local /tmp
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-NoNewPrivileges=true
+NoNewPrivileges=false
+MemoryDenyWriteExecute=false
 
 [Install]
 WantedBy=multi-user.target
