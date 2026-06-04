@@ -90,6 +90,8 @@ Commands:
   apply-canonical       Apply game config: sietch name, PvP partitions, memory limits, game settings
   install-manager-service [--port PORT] [--timezone TZ] [--auth-token-file FILE]
                         Install the dune-server-service daemon (GM tools, player tracking, scheduling)
+  update-manager-service
+                        Update dune-server-service binary to the latest GitHub release
   uninstall-manager-service
                         Remove the dune-server-service daemon
   exposure-report       Show Dune public/admin listeners and firewall posture
@@ -2208,6 +2210,36 @@ EOF
   printf 'Desktop app: https://github.com/%s/releases\n' "${MANAGER_SERVICE_REPO}"
 }
 
+update_manager_service() {
+  command -v curl >/dev/null 2>&1 || die "curl is required to download the manager service binary"
+
+  log "Fetching latest release info for ${MANAGER_SERVICE_REPO}"
+  local release_json release_tag download_url current_version
+  release_json="$(curl -fsSL "https://api.github.com/repos/${MANAGER_SERVICE_REPO}/releases/latest")"
+  release_tag="$(printf '%s' "${release_json}" | jq -r '.tag_name')"
+  [ -n "${release_tag}" ] || die "Could not determine latest release tag for ${MANAGER_SERVICE_REPO}"
+
+  download_url="$(printf '%s' "${release_json}" |
+    jq -r '.assets[] | select(.name == "dune-server-service") | .browser_download_url' | head -n1)"
+  [ -n "${download_url}" ] || die "Could not find dune-server-service Linux binary in release ${release_tag}"
+
+  if [ -x "${MANAGER_SERVICE_BIN}" ]; then
+    current_version="$("${MANAGER_SERVICE_BIN}" --version 2>/dev/null | awk '{print $NF}' || true)"
+    [ -n "${current_version}" ] && log "Current version: ${current_version}"
+  fi
+  log "Latest version:  ${release_tag}"
+
+  log "Stopping dune-server-service"
+  as_root systemctl stop "$(basename "${MANAGER_SERVICE_UNIT}")" || true
+
+  log "Downloading dune-server-service ${release_tag}"
+  curl -fsSL "${download_url}" | as_root tee "${MANAGER_SERVICE_BIN}" >/dev/null
+  as_root chmod 0755 "${MANAGER_SERVICE_BIN}"
+
+  as_root systemctl start "$(basename "${MANAGER_SERVICE_UNIT}")"
+  ok "Updated to ${release_tag} and restarted"
+}
+
 uninstall_manager_service() {
   as_root systemctl disable --now "$(basename "${MANAGER_SERVICE_UNIT}")" >/dev/null 2>&1 || true
   as_root rm -f "${MANAGER_SERVICE_UNIT}" "${MANAGER_SERVICE_ENV}"
@@ -3360,6 +3392,10 @@ main() {
     install-manager-service)
       if ! is_root; then exec sudo -E bash "$0" install-manager-service "$@"; fi
       install_manager_service "$@"
+      ;;
+    update-manager-service)
+      if ! is_root; then exec sudo -E bash "$0" update-manager-service "$@"; fi
+      update_manager_service
       ;;
     uninstall-manager-service)
       if ! is_root; then exec sudo -E bash "$0" uninstall-manager-service "$@"; fi
