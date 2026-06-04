@@ -126,7 +126,7 @@ Setup options:
   --internal-ip IP      Node internal IP. Defaults to detected host IP
   --interface IFACE     Interface used for detected host IP
   --world-name NAME     World name to create during setup
-  --world-region REGION World region: Europe or North America. Numeric selections 1-2 match the vendor menu
+  --world-region REGION World region: Europe, North America, Asia, Oceania, South America. Numeric selections 1-5 match the vendor menu
   --self-hosted-token TOKEN
                         Self-hosting token from the Dune account page
   --self-hosted-token-file FILE
@@ -163,6 +163,7 @@ Environment:
   DUNE_MEM_OVERMAP      Overmap memory limit for apply-canonical
   DUNE_MEM_SIETCH       Sietch hub memory limit for apply-canonical
   DUNE_MINING_MULTIPLIER Mining output multiplier for apply-canonical
+  DUNE_SERVER_PASSWORD  Join password for apply-canonical
   DUNE_MANAGER_PORT     Manager service HTTP port. Default: 29187
   DUNE_MANAGER_TIMEZONE Manager service timezone. Default: Europe/London
   DUNE_ADMIN_ALLOWED_CIDRS
@@ -685,6 +686,9 @@ world_region_selection() {
   case "${region}" in
     1|europe|europe\ test|europe-test|europe_test) echo 1 ;;
     2|north\ america|north-america|north_america|north\ america\ test|north-america-test|north_america_test) echo 2 ;;
+    3|asia) echo 3 ;;
+    4|oceania) echo 4 ;;
+    5|south\ america|south-america|south_america) echo 5 ;;
     *) die "Unsupported world region: $1" ;;
   esac
 }
@@ -1972,6 +1976,7 @@ apply_canonical() {
   local always_on_deep_desert="${DUNE_ALWAYS_ON_DEEP_DESERT:-0}"
   local always_on_sietches="${DUNE_ALWAYS_ON_SIETCHES:-0}"
   local mining_multiplier="${DUNE_MINING_MULTIPLIER:-}"
+  local server_password="${DUNE_SERVER_PASSWORD:-}"
   local no_stop=0
 
   while [ "$#" -gt 0 ]; do
@@ -1985,6 +1990,7 @@ apply_canonical() {
       --always-on-deep-desert) always_on_deep_desert=1; shift ;;
       --always-on-sietches) always_on_sietches=1; shift ;;
       --mining-multiplier) mining_multiplier="${2:-}"; shift 2 ;;
+      --server-password) server_password="${2:-}"; shift 2 ;;
       --no-stop) no_stop=1; shift ;;
       --yes|-y) ASSUME_YES=1; shift ;;
       --help|-h)
@@ -1998,6 +2004,7 @@ apply_canonical() {
         printf '  --always-on-deep-desert    Set Deep Desert dedicatedScaling=false (always-on)\n'
         printf '  --always-on-sietches       Set SH_Arrakeen + SH_HarkoVillage to always-on\n'
         printf '  --mining-multiplier FLOAT  GlobalMiningOutputMultiplier (e.g. 1.5)\n'
+        printf '  --server-password PASS     Join password (empty string clears it)\n'
         printf '  --no-stop                  Do not stop/start battlegroup around changes\n'
         return 0
         ;;
@@ -2060,6 +2067,18 @@ apply_canonical() {
     as_root sed -i "/^\[ConsoleVariables\]/a Dune.GlobalMiningOutputMultiplier=${mining_multiplier}" \
       "${usersettings}/UserEngine.ini"
     ok "Set Dune.GlobalMiningOutputMultiplier=${mining_multiplier}"
+  fi
+
+  if [ -n "${server_password}" ]; then
+    log "Setting server login password in UserEngine.ini"
+    as_root sed -i '/^Bgd\.ServerLoginPassword=/d' "${usersettings}/UserEngine.ini"
+    as_root sed -i "/^\[ConsoleVariables\]/a Bgd.ServerLoginPassword=\"${server_password}\"" \
+      "${usersettings}/UserEngine.ini"
+    ok "Set Bgd.ServerLoginPassword (password not echoed)"
+  elif as_root grep -q '^Bgd\.ServerLoginPassword=' "${usersettings}/UserEngine.ini" 2>/dev/null; then
+    log "Clearing server login password from UserEngine.ini"
+    as_root sed -i '/^Bgd\.ServerLoginPassword=/d' "${usersettings}/UserEngine.ini"
+    ok "Cleared Bgd.ServerLoginPassword"
   fi
 
   if [ -n "${pvp_partition}" ]; then

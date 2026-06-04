@@ -102,8 +102,9 @@ PgHero defaults to the vendor port `9999`. If that port is already occupied
 when world creation runs, the script automatically uses `10099` when available.
 You can set the port explicitly with `--pghero-port PORT` or `DUNE_PGHERO_PORT`.
 
-Accepted regions currently match the vendor self-host menu: `Europe` and
-`North America`. Numeric selections `1` and `2` also match that menu.
+Accepted regions match the vendor self-host menu: `Europe`, `North America`,
+`Asia`, `Oceania`, `South America`. Numeric selections `1`–`5` also match that
+menu.
 
 ## Management
 
@@ -223,6 +224,7 @@ All flags are optional; only the ones you pass are changed. Common options:
 | `--always-on-deep-desert` | Keep Deep Desert always-running (`dedicatedScaling=false`) |
 | `--always-on-sietches` | Keep sietch hubs always-running |
 | `--mining-multiplier FLOAT` | `Dune.GlobalMiningOutputMultiplier` in `UserEngine.ini` |
+| `--server-password PASS` | Join password (`Bgd.ServerLoginPassword`); pass empty string to remove |
 | `--no-stop` | Apply without stopping/restarting the battlegroup |
 
 The command stops the battlegroup, patches the BattleGroup CR and the
