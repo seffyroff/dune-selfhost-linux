@@ -7,7 +7,7 @@ The shipped package is a Hyper-V VM wrapper around a small Alpine Linux guest.
 The useful guest state is:
 
 - k3s `v1.34.5+k3s1`
-- Steam app `3104830`, downloaded with SteamCMD into `/home/dune/.dune/download`
+- Steam app `4754530` ("Dune: Awakening Self-Hosted Server"), downloaded with SteamCMD into `/home/dune/.dune/download`
 - the vendor `scripts/setup.sh` and `scripts/battlegroup.sh` tools from that app
 - `/home/dune/.dune/settings.conf`, whose fourth line is the player-facing IP
 - a k3s scheduler profile named `memory-focused-scheduler`
@@ -69,9 +69,10 @@ Useful options:
 ```
 
 The script installs dependencies where it knows how, installs SteamCMD if needed,
-downloads the Linux depot for Steam app `3104830`, starts k3s, installs
-cert-manager, recreates the Funcom operator base resources, imports the packaged
-container images, and scales the core/operator deployments.
+downloads the Linux depot for Steam app `4754530`, starts k3s, installs a
+containerd socket symlink for vendor script compatibility, installs cert-manager,
+recreates the Funcom operator base resources, imports the packaged container
+images, and scales the core/operator deployments.
 
 World creation is separate unless you provide all required world inputs. This
 avoids the vendor `world.sh` prompt loop when setup is run unattended.
@@ -111,6 +112,7 @@ Accepted regions currently match the vendor self-host menu: `Europe` and
 ./linux/dune-native.sh status
 ./linux/dune-native.sh doctor
 ./linux/dune-native.sh doctor --external
+./linux/dune-native.sh doctor --json
 ./linux/dune-native.sh update
 ./linux/dune-native.sh stop
 ./linux/dune-native.sh backup
@@ -137,7 +139,9 @@ Monitoring and access helpers:
 
 `doctor` checks host prerequisites, k3s/node health, cert-manager, Funcom
 operators, battlegroup status, exposed service ports, token placement without
-printing token values, generated YAML permissions, and database backup presence.
+printing token values, generated YAML permissions, database backup presence, and
+whether the BGD has fired a populated `DeclareBattlegroupUpdates` call (the
+mechanism that makes the server visible in the in-game browser).
 Run `./linux/dune-native.sh backup` after world creation to establish the first
 restore point and clear the backup warning.
 
@@ -155,6 +159,9 @@ The external probe checks the TCP RMQ game NodePort directly. If `nmap` is
 installed on the probe host, it also runs a UDP check for port `7777`; UDP game
 protocols may not answer generic probes, so `open|filtered` means the port is
 not reported closed rather than a full gameplay handshake.
+
+`doctor --json` emits all checks as structured JSON — useful for the manager
+service API or scripted monitoring.
 
 `install-backup-timer` creates:
 
@@ -191,6 +198,60 @@ Disable backup copies with:
 ```bash
 ./linux/dune-native.sh set-backup-copy-target none
 ```
+
+## Game Configuration
+
+Apply game settings idempotently after world creation (or to re-apply after a
+Funcom image update resets the defaults):
+
+```bash
+./linux/dune-native.sh apply-canonical \
+  --sietch-name "My Sietch" \
+  --pvp-partition 8
+```
+
+All flags are optional; only the ones you pass are changed. Common options:
+
+| Flag | What it sets |
+|---|---|
+| `--sietch-name NAME` | In-game server browser display name (`Bgd.ServerDisplayName` in `UserEngine.ini`) |
+| `--pvp-partition ID` | Which partition ID is the PvP instance in `UserGame.ini` (default: `8` = `DeepDesert_1`) |
+| `--mem-survival GiB` | Hagga Basin pod memory limit (e.g. `24Gi`) |
+| `--mem-deep-desert GiB` | Deep Desert pod memory limit |
+| `--mem-overmap GiB` | Overmap pod memory limit |
+| `--mem-sietch GiB` | Sietch hub pod memory limit |
+| `--always-on-deep-desert` | Keep Deep Desert always-running (`dedicatedScaling=false`) |
+| `--always-on-sietches` | Keep sietch hubs always-running |
+| `--mining-multiplier FLOAT` | `Dune.GlobalMiningOutputMultiplier` in `UserEngine.ini` |
+| `--no-stop` | Apply without stopping/restarting the battlegroup |
+
+The command stops the battlegroup, patches the BattleGroup CR and the
+`UserGame.ini`/`UserEngine.ini` files on the server PVC, then restarts. It is
+idempotent — safe to run repeatedly after Funcom updates reset the ini defaults.
+
+Memory limit and always-on flags have no defaults and are only applied when
+explicitly passed, so they cannot accidentally break a 20 GB host.
+
+## Manager Service
+
+`install-manager-service` installs the
+[dune-server-service](https://github.com/adainrivers/dune-dedicated-server-manager)
+daemon — a Rust HTTP API that runs alongside k3s and provides in-game GM tools
+(item grants, vehicle spawns, teleports, broadcasts via RabbitMQ), real-time
+player location queries (via PostgreSQL), and scheduled maintenance (daily
+restarts, auto-backups).
+
+```bash
+./linux/dune-native.sh install-manager-service --timezone Europe/London
+./linux/dune-native.sh uninstall-manager-service
+```
+
+The daemon listens on `localhost:29187` and is accessed securely through an SSH
+tunnel from the companion desktop app. `doctor` will check its health when
+installed.
+
+The daemon's `/api/admin/player-location` and `/api/admin/players` endpoints are
+also the data source for a future real-time web map of Hagga Basin and Deep Desert.
 
 ## Firewall And Admin Exposure
 
@@ -283,8 +344,10 @@ practical to its pre-install state:
 
 It removes:
 
+- the manager service (`dune-server-service`) if installed
 - the dedicated `inet dune_native` nftables table and firewall unit
 - backup timer/service/env and `/var/log/dune-native`
+- containerd socket symlink config (`/etc/tmpfiles.d/k3s-containerd-symlink.conf`)
 - native k3s service, cluster state, CNI state, and Dune k3s runner
 - `/etc/sudoers.d/dune-native`
 - Dune-created `rc-service` and `rc-update` compatibility wrappers when their
@@ -314,7 +377,7 @@ Run the local harness with:
 
 The tests do not require a live Dune server or a real k3s cluster. They run
 `dune-native.sh` against a temporary root with stubbed `systemctl`, `nft`, `k3s`,
-`ss`, `id`, `pkill`, and `userdel` commands.
+`ss`, `id`, `pkill`, `userdel`, and `systemd-tmpfiles` commands.
 
 Covered behavior:
 
@@ -323,6 +386,9 @@ Covered behavior:
 - firewall install generates only the dedicated `inet dune_native` table
 - player-facing `31982/tcp` and unrelated ports such as SSH are not dropped
 - firewall uninstall removes only Dune firewall artifacts
+- containerd socket symlink config is created by setup and removed by teardown
+- `apply-canonical` sets sietch name and PvP partition idempotently
+- `doctor --json` produces valid JSON with the expected schema
 - teardown `--dry-run` does not remove owned state
 - teardown `--yes` removes owned state while preserving unrelated files and
   off-host backup targets
@@ -409,7 +475,7 @@ script recreates the parts that matter on a normal systemd Linux host:
 
 - k3s service configuration and node IP/public IP handling
 - the `dune` service user, `/home/dune/.dune` layout, and `settings.conf`
-- SteamCMD download of app `3104830` forced to the Linux depot
+- SteamCMD download of app `4754530` forced to the Linux depot
 - `kubectl`, `rc-service`, and `rc-update` compatibility expected by vendor scripts
 - cert-manager manifests, which are not shipped as plain Kubernetes YAML
 - Funcom operator namespace, CRDs, RBAC, leader-election RBAC, deployments, and webhook TLS secret
@@ -421,6 +487,8 @@ script recreates the parts that matter on a normal systemd Linux host:
 This is a native host install, not a converted KVM VM. The original VHDX is only
 used as a reference for the k3s version and guest configuration.
 
-The installer has been executed locally through core setup. At that point the
-k3s node, cert-manager, kube-system pods, and all four Funcom operators were
-Running. Full battlegroup creation still requires a valid self-hosting token.
+The GA Steam product is app `4754530`. The older PTC app `3104830` is out of
+date; running it causes the Battlegroup Director to silently skip the
+`Battlegroups_DeclareBattlegroupUpdates` FLS call, making the server invisible in
+the in-game browser despite reporting `Healthy`. `doctor` will flag this as a
+warning if the BGD logs show no populated Declare calls.

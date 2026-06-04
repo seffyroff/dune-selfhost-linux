@@ -4,10 +4,10 @@ set -Eeuo pipefail
 # Linux-native Dune: Awakening dedicated server bootstrap.
 #
 # This recreates the useful parts of the shipped Hyper-V guest directly on a
-# Linux host: k3s, the Dune user/home layout, SteamCMD app 3104830, and the
+# Linux host: k3s, the Dune user/home layout, SteamCMD app 4754530, and the
 # battlegroup setup/management entrypoint.
 
-APP_ID="${DUNE_STEAM_APP_ID:-3104830}"
+APP_ID="${DUNE_STEAM_APP_ID:-4754530}"
 K3S_VERSION="v1.34.5+k3s1"
 CERT_MANAGER_VERSION="v1.8.0"
 DUNE_USER="${DUNE_USER:-dune}"
@@ -45,6 +45,12 @@ FIREWALL_SERVICE="${SYSTEMD_DIR}/dune-native-firewall.service"
 DEFAULT_BACKUP_ON_CALENDAR="03:30"
 DEFAULT_BACKUP_RETENTION_DAYS=14
 DEFAULT_BACKUP_MAX_AGE_HOURS=30
+CONTAINERD_SYMLINK_CONF="${HOST_ETC}/tmpfiles.d/k3s-containerd-symlink.conf"
+MANAGER_SERVICE_DIR="${HOST_OPT}/dune-server-service"
+MANAGER_SERVICE_BIN="${MANAGER_SERVICE_DIR}/dune-server-service"
+MANAGER_SERVICE_UNIT="${SYSTEMD_DIR}/dune-server-service.service"
+MANAGER_SERVICE_ENV="${HOST_ETC}/dune-server-service.env"
+MANAGER_SERVICE_REPO="adainrivers/dune-dedicated-server-manager"
 
 red=$'\033[0;31m'
 green=$'\033[0;32m'
@@ -59,7 +65,8 @@ Usage: $0 <command> [options]
 Commands:
   setup                 Install/configure k3s, download the Dune server app, and run native core setup
   create-world          Create the first battlegroup world after setup
-  doctor [--external]  Run host, cluster, battlegroup, port, secret, and backup checks
+  doctor [--external] [--json]
+                        Run health checks; --json emits machine-readable output for the manager service API
   start                 Start the battlegroup
   stop                  Stop the battlegroup
   restart               Restart the battlegroup
@@ -80,6 +87,11 @@ Commands:
                         Delete database backups older than the retention period
   restore-check [BACKUP] Validate that a backup can be staged for import without changing data
   restore-latest        Restore the newest backup after typed destructive confirmation
+  apply-canonical       Apply game config: sietch name, PvP partitions, memory limits, game settings
+  install-manager-service [--port PORT] [--timezone TZ] [--auth-token-file FILE]
+                        Install the dune-server-service daemon (GM tools, player tracking, scheduling)
+  uninstall-manager-service
+                        Remove the dune-server-service daemon
   exposure-report       Show Dune public/admin listeners and firewall posture
   firewall-plan         Print firewall hardening commands/snippets without applying them
   install-firewall [--admin-cidrs CIDR[,CIDR]]
@@ -144,6 +156,15 @@ Environment:
                         Doctor warning threshold for latest backup age. Default: 30
   DUNE_BACKUP_COPY_TARGET
                         Optional local directory or rclone:remote:path for backup copies
+  DUNE_SIETCH_NAME      Sietch display name for apply-canonical
+  DUNE_PVP_PARTITION    PvP partition ID for apply-canonical (default: 8)
+  DUNE_MEM_SURVIVAL     Hagga Basin memory limit for apply-canonical (e.g. 24Gi)
+  DUNE_MEM_DEEP_DESERT  Deep Desert memory limit for apply-canonical
+  DUNE_MEM_OVERMAP      Overmap memory limit for apply-canonical
+  DUNE_MEM_SIETCH       Sietch hub memory limit for apply-canonical
+  DUNE_MINING_MULTIPLIER Mining output multiplier for apply-canonical
+  DUNE_MANAGER_PORT     Manager service HTTP port. Default: 29187
+  DUNE_MANAGER_TIMEZONE Manager service timezone. Default: Europe/London
   DUNE_ADMIN_ALLOWED_CIDRS
                         Comma-separated CIDRs allowed to reach admin surfaces
   DUNE_EXTERNAL_PROBE_SSH
@@ -316,6 +337,14 @@ esac
 EOF
     chmod 0755 "${RC_UPDATE_BIN}"
   fi
+}
+
+install_containerd_socket_symlink() {
+  log "Installing containerd socket symlink for vendor script compatibility"
+  install -d -m 0755 "${HOST_ETC}/tmpfiles.d"
+  printf 'L /run/containerd /run/k3s/containerd\n' | as_root tee "${CONTAINERD_SYMLINK_CONF}" >/dev/null
+  as_root systemd-tmpfiles --create "${CONTAINERD_SYMLINK_CONF}" 2>/dev/null || true
+  ok "Installed containerd socket symlink"
 }
 
 detect_interface() {
@@ -1132,6 +1161,7 @@ setup_native() {
   install_openrc_compat_wrappers
   write_settings "${internal_ip}" "${public_ip}"
   install_k3s
+  install_containerd_socket_symlink
   wait_for_k3s
   install_cert_manager_manifest
   download_steam_app
@@ -1675,9 +1705,39 @@ backup_prune() {
   ok "Backup prune complete"
 }
 
+find_server_pv_path() {
+  local ns="$1"
+  local pvc_name pv_name pv_path
+  pvc_name="$(run_kubectl get pvc -n "${ns}" -l role=igw-server \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${pvc_name}" ] || die "Could not find server PVC (label role=igw-server) in ${ns}"
+  pv_name="$(run_kubectl get pvc "${pvc_name}" -n "${ns}" \
+    -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+  [ -n "${pv_name}" ] || die "PVC ${pvc_name} has no bound PV"
+  pv_path="$(run_kubectl get pv "${pv_name}" \
+    -o jsonpath='{.spec.local.path}{.spec.hostPath.path}' 2>/dev/null || true)"
+  [ -n "${pv_path}" ] || die "Could not resolve host path for PV ${pv_name}"
+  printf '%s\n' "${pv_path}"
+}
+
+patch_bg_set_field() {
+  local ns="$1" bg="$2" map="$3" field_path="$4" json_value="$5"
+  local idx
+  idx="$(run_kubectl get igwbg -n "${ns}" "${bg}" -o json 2>/dev/null |
+    jq -r --arg m "${map}" \
+    '.spec.serverGroup.template.spec.sets | to_entries[] | select(.value.map == $m) | .key' \
+    2>/dev/null | head -n1)"
+  if [ -z "${idx}" ]; then
+    warn "No ServerSet found for map ${map}; skipping ${field_path} patch"
+    return 0
+  fi
+  run_kubectl patch igwbg -n "${ns}" "${bg}" --type=json \
+    -p="[{\"op\":\"replace\",\"path\":\"/spec/serverGroup/template/spec/sets/${idx}/${field_path}\",\"value\":${json_value}}]"
+}
+
 restore_check() {
   local requested="${1:-}"
-  local ns bg backup_file backup_name backup_spec pvc_name pv_name pv_path pvc_dumps_dir size
+  local ns bg backup_file backup_name backup_spec pv_path pvc_dumps_dir size
   ns="$(single_battlegroup_namespace)"
   bg="${ns#funcom-seabass-}"
   backup_file="$(backup_select_for_bg "${bg}" "${requested}")"
@@ -1697,12 +1757,7 @@ restore_check() {
   log "Checking restore prerequisites for ${backup_name}"
   run_kubectl get battlegroup -n "${ns}" "${bg}" >/dev/null
   run_kubectl get database -n "${ns}" "${bg}-db" >/dev/null
-  pvc_name="$(run_kubectl get pvc -n "${ns}" -l role=igw-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [ -n "${pvc_name}" ] || die "Could not find server PVC with label role=igw-server in ${ns}"
-  pv_name="$(run_kubectl get pvc "${pvc_name}" -n "${ns}" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
-  [ -n "${pv_name}" ] || die "PVC ${pvc_name} has no bound PV"
-  pv_path="$(run_kubectl get pv "${pv_name}" -o jsonpath='{.spec.local.path}{.spec.hostPath.path}' 2>/dev/null || true)"
-  [ -n "${pv_path}" ] || die "Could not resolve host path for PV ${pv_name}"
+  pv_path="$(find_server_pv_path "${ns}")"
   as_root test -d "${pv_path}" || die "PV host path does not exist: ${pv_path}"
   pvc_dumps_dir="${pv_path}/Saved/DatabaseDumps"
   if as_root test -d "${pvc_dumps_dir}"; then
@@ -1905,6 +1960,210 @@ uninstall_backup_timer() {
   as_root rm -f "${BACKUP_TIMER}" "${BACKUP_SERVICE}" "${BACKUP_ENV_FILE}"
   as_root systemctl daemon-reload
   ok "Removed backup timer/service"
+}
+
+apply_canonical() {
+  local sietch_name="${DUNE_SIETCH_NAME:-}"
+  local pvp_partition="${DUNE_PVP_PARTITION:-}"
+  local mem_survival="${DUNE_MEM_SURVIVAL:-}"
+  local mem_deep_desert="${DUNE_MEM_DEEP_DESERT:-}"
+  local mem_overmap="${DUNE_MEM_OVERMAP:-}"
+  local mem_sietch="${DUNE_MEM_SIETCH:-}"
+  local always_on_deep_desert="${DUNE_ALWAYS_ON_DEEP_DESERT:-0}"
+  local always_on_sietches="${DUNE_ALWAYS_ON_SIETCHES:-0}"
+  local mining_multiplier="${DUNE_MINING_MULTIPLIER:-}"
+  local no_stop=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --sietch-name) sietch_name="${2:-}"; shift 2 ;;
+      --pvp-partition) pvp_partition="${2:-}"; shift 2 ;;
+      --mem-survival) mem_survival="${2:-}"; shift 2 ;;
+      --mem-deep-desert) mem_deep_desert="${2:-}"; shift 2 ;;
+      --mem-overmap) mem_overmap="${2:-}"; shift 2 ;;
+      --mem-sietch) mem_sietch="${2:-}"; shift 2 ;;
+      --always-on-deep-desert) always_on_deep_desert=1; shift ;;
+      --always-on-sietches) always_on_sietches=1; shift ;;
+      --mining-multiplier) mining_multiplier="${2:-}"; shift 2 ;;
+      --no-stop) no_stop=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --help|-h)
+        printf 'Usage: %s apply-canonical [options]\n' "$0"
+        printf '  --sietch-name NAME         In-game server browser display name\n'
+        printf '  --pvp-partition ID         PvP partition ID (default: 8 = DeepDesert_1)\n'
+        printf '  --mem-survival GiB         Hagga Basin pod memory limit (e.g. 24Gi)\n'
+        printf '  --mem-deep-desert GiB      Deep Desert pod memory limit\n'
+        printf '  --mem-overmap GiB          Overmap pod memory limit\n'
+        printf '  --mem-sietch GiB           Sietch hub pod memory limit\n'
+        printf '  --always-on-deep-desert    Set Deep Desert dedicatedScaling=false (always-on)\n'
+        printf '  --always-on-sietches       Set SH_Arrakeen + SH_HarkoVillage to always-on\n'
+        printf '  --mining-multiplier FLOAT  GlobalMiningOutputMultiplier (e.g. 1.5)\n'
+        printf '  --no-stop                  Do not stop/start battlegroup around changes\n'
+        return 0
+        ;;
+      *) die "Unknown apply-canonical option: $1" ;;
+    esac
+  done
+
+  local ns bg pv_path usersettings
+  ns="$(single_battlegroup_namespace)"
+  bg="${ns#funcom-seabass-}"
+
+  if [ "${no_stop}" != "1" ]; then
+    log "Stopping battlegroup before applying canonical config"
+    run_battlegroup stop || true
+  fi
+
+  if [ -n "${mem_survival}" ]; then
+    log "Patching Survival_1 (Hagga Basin) memory limit to ${mem_survival}"
+    patch_bg_set_field "${ns}" "${bg}" "Survival_1" "resources/limits/memory" "\"${mem_survival}\""
+  fi
+  if [ -n "${mem_deep_desert}" ]; then
+    log "Patching DeepDesert_1 memory limit to ${mem_deep_desert}"
+    patch_bg_set_field "${ns}" "${bg}" "DeepDesert_1" "resources/limits/memory" "\"${mem_deep_desert}\""
+  fi
+  if [ -n "${mem_overmap}" ]; then
+    log "Patching Overmap memory limit to ${mem_overmap}"
+    patch_bg_set_field "${ns}" "${bg}" "Overmap" "resources/limits/memory" "\"${mem_overmap}\""
+  fi
+  if [ -n "${mem_sietch}" ]; then
+    log "Patching SH_Arrakeen memory limit to ${mem_sietch}"
+    patch_bg_set_field "${ns}" "${bg}" "SH_Arrakeen" "resources/limits/memory" "\"${mem_sietch}\""
+    log "Patching SH_HarkoVillage memory limit to ${mem_sietch}"
+    patch_bg_set_field "${ns}" "${bg}" "SH_HarkoVillage" "resources/limits/memory" "\"${mem_sietch}\""
+  fi
+  if [ "${always_on_deep_desert}" = "1" ]; then
+    log "Setting DeepDesert_1 to always-on (dedicatedScaling=false)"
+    patch_bg_set_field "${ns}" "${bg}" "DeepDesert_1" "dedicatedScaling" "false"
+  fi
+  if [ "${always_on_sietches}" = "1" ]; then
+    log "Setting SH_Arrakeen and SH_HarkoVillage to always-on"
+    patch_bg_set_field "${ns}" "${bg}" "SH_Arrakeen" "dedicatedScaling" "false"
+    patch_bg_set_field "${ns}" "${bg}" "SH_HarkoVillage" "dedicatedScaling" "false"
+  fi
+
+  pv_path="$(find_server_pv_path "${ns}")"
+  usersettings="${pv_path}/Saved/UserSettings"
+  as_root test -d "${usersettings}" || die "UserSettings directory not found: ${usersettings}"
+
+  if [ -n "${sietch_name}" ]; then
+    log "Setting sietch display name in UserEngine.ini"
+    as_root sed -i '/^Bgd\.ServerDisplayName=/d' "${usersettings}/UserEngine.ini"
+    as_root sed -i "/^\[ConsoleVariables\]/a Bgd.ServerDisplayName=\"${sietch_name}\"" \
+      "${usersettings}/UserEngine.ini"
+    ok "Set Bgd.ServerDisplayName=\"${sietch_name}\""
+  fi
+
+  if [ -n "${mining_multiplier}" ]; then
+    log "Setting mining multiplier in UserEngine.ini"
+    as_root sed -i '/^Dune\.GlobalMiningOutputMultiplier=/d' "${usersettings}/UserEngine.ini"
+    as_root sed -i "/^\[ConsoleVariables\]/a Dune.GlobalMiningOutputMultiplier=${mining_multiplier}" \
+      "${usersettings}/UserEngine.ini"
+    ok "Set Dune.GlobalMiningOutputMultiplier=${mining_multiplier}"
+  fi
+
+  if [ -n "${pvp_partition}" ]; then
+    log "Setting PvP partition in UserGame.ini"
+    as_root sed -i '/^\+m_PvpEnabledPartitions=/d' "${usersettings}/UserGame.ini"
+    as_root sed -i "/^\[\/Script\/DuneSandbox\.PvpPveSettings\]/a +m_PvpEnabledPartitions=${pvp_partition}" \
+      "${usersettings}/UserGame.ini"
+    ok "Set +m_PvpEnabledPartitions=${pvp_partition}"
+  fi
+
+  if [ "${no_stop}" != "1" ]; then
+    log "Starting battlegroup"
+    run_battlegroup start
+  fi
+
+  ok "Canonical config applied. Run: $0 doctor to verify."
+}
+
+install_manager_service() {
+  local port="${DUNE_MANAGER_PORT:-29187}"
+  local timezone="${DUNE_MANAGER_TIMEZONE:-Europe/London}"
+  local auth_token_file=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port) port="${2:-}"; shift 2 ;;
+      --timezone) timezone="${2:-}"; shift 2 ;;
+      --auth-token-file) auth_token_file="${2:-}"; shift 2 ;;
+      --help|-h)
+        printf 'Usage: %s install-manager-service [--port PORT] [--timezone TZ] [--auth-token-file FILE]\n' "$0"
+        return 0
+        ;;
+      *) die "Unknown install-manager-service option: $1" ;;
+    esac
+  done
+
+  validate_tcp_port "${port}" "manager service port"
+  command -v curl >/dev/null 2>&1 || die "curl is required to download the manager service binary"
+
+  log "Fetching latest release info for ${MANAGER_SERVICE_REPO}"
+  local release_json release_tag download_url
+  release_json="$(curl -fsSL "https://api.github.com/repos/${MANAGER_SERVICE_REPO}/releases/latest")"
+  release_tag="$(printf '%s' "${release_json}" | jq -r '.tag_name')"
+  [ -n "${release_tag}" ] || die "Could not determine latest release tag for ${MANAGER_SERVICE_REPO}"
+
+  download_url="$(printf '%s' "${release_json}" |
+    jq -r '.assets[] | select(.name == "dune-server-service") | .browser_download_url' | head -n1)"
+  [ -n "${download_url}" ] || die "Could not find dune-server-service Linux binary in release ${release_tag}; check https://github.com/${MANAGER_SERVICE_REPO}/releases"
+
+  log "Installing dune-server-service ${release_tag} to ${MANAGER_SERVICE_DIR}"
+  as_root install -d -m 0755 "${MANAGER_SERVICE_DIR}"
+  curl -fsSL "${download_url}" | as_root tee "${MANAGER_SERVICE_BIN}" >/dev/null
+  as_root chmod 0755 "${MANAGER_SERVICE_BIN}"
+
+  local ns
+  ns="$(single_battlegroup_namespace 2>/dev/null || true)"
+  {
+    printf 'DUNE_DASHBOARD_PORT=%s\n' "${port}"
+    printf 'DUNE_SERVICE_HOME=%s\n' "${DUNE_HOME}"
+    printf 'DUNE_SERVICE_TIME_ZONE=%s\n' "${timezone}"
+    [ -n "${ns}" ] && printf 'DUNE_NAMESPACE=%s\n' "${ns}"
+    [ -n "${auth_token_file}" ] && printf 'DUNE_COMMAND_AUTH_TOKEN_FILE=%s\n' "${auth_token_file}"
+  } | as_root tee "${MANAGER_SERVICE_ENV}" >/dev/null
+  as_root chmod 0640 "${MANAGER_SERVICE_ENV}"
+
+  as_root install -d -m 0755 "$(dirname "${MANAGER_SERVICE_UNIT}")"
+  cat <<EOF | as_root tee "${MANAGER_SERVICE_UNIT}" >/dev/null
+[Unit]
+Description=Dune server management service
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${DUNE_USER}
+Group=${DUNE_USER}
+ExecStart=${MANAGER_SERVICE_BIN}
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${DUNE_ROOT}/bin"
+EnvironmentFile=-${MANAGER_SERVICE_ENV}
+Restart=on-failure
+RestartSec=10
+ReadWritePaths=${DUNE_HOME}/.dune ${DUNE_HOME}/.local /tmp
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "$(basename "${MANAGER_SERVICE_UNIT}")"
+  ok "Manager service installed and started on port ${port}"
+  printf 'Connect via the dune-dedicated-server-manager desktop app (SSH tunnel to localhost:%s)\n' "${port}"
+  printf 'Desktop app: https://github.com/%s/releases\n' "${MANAGER_SERVICE_REPO}"
+}
+
+uninstall_manager_service() {
+  as_root systemctl disable --now "$(basename "${MANAGER_SERVICE_UNIT}")" >/dev/null 2>&1 || true
+  as_root rm -f "${MANAGER_SERVICE_UNIT}" "${MANAGER_SERVICE_ENV}"
+  as_root rm -rf "${MANAGER_SERVICE_DIR}"
+  as_root systemctl daemon-reload
+  ok "Removed manager service"
 }
 
 load_firewall_env() {
@@ -2249,8 +2508,10 @@ teardown_show_plan() {
 
   printf 'Dune native teardown plan\n\n'
   printf 'Will remove/disable:\n'
+  printf '  - manager service (dune-server-service) if installed\n'
   printf '  - dedicated Dune nftables table and firewall systemd unit\n'
   printf '  - scheduled backup timer/service and %s\n' "${BACKUP_ENV_FILE}"
+  printf '  - containerd socket symlink tmpfiles.d config: %s\n' "${CONTAINERD_SYMLINK_CONF}"
   printf '  - native k3s service, cluster state, CNI state, and Dune k3s runner\n'
   printf '  - Dune sudoers file: %s\n' "${SUDOERS_FILE}"
   printf '  - Dune-created OpenRC compatibility wrappers when their contents match this script\n'
@@ -2310,6 +2571,11 @@ teardown_native() {
     [ "${confirm_text}" = "TEARDOWN ${DUNE_USER}" ] || die "Teardown aborted"
   fi
 
+  if as_root test -f "${MANAGER_SERVICE_UNIT}"; then
+    log "Removing manager service"
+    uninstall_manager_service || true
+  fi
+
   log "Removing Dune firewall"
   uninstall_firewall || true
 
@@ -2334,6 +2600,7 @@ teardown_native() {
   as_root rm -rf "${K3S_DATA_DIR}" "${K3S_CONFIG_DIR}" "${HOST_RUN}/k3s" "${HOST_VAR}/lib/cni" "${HOST_ETC}/cni/net.d/10-flannel.conflist"
 
   log "Removing Dune host integration files"
+  as_root rm -f "${CONTAINERD_SYMLINK_CONF}"
   as_root rm -f "${SUDOERS_FILE}"
   remove_file_if_contains "${RC_SERVICE_BIN}" 'exec systemctl'
   remove_file_if_contains "${RC_UPDATE_BIN}" 'Unsupported rc-update action'
@@ -2362,10 +2629,43 @@ teardown_native() {
 
 DOCTOR_FAILS=0
 DOCTOR_WARNS=0
+DOCTOR_JSON_MODE=0
+DOCTOR_JSON_CHECKS=()
+DOCTOR_CURRENT_SECTION=""
 
-doctor_ok() { printf '%s\n' "${green}OK${nc}   $*"; }
-doctor_warn() { DOCTOR_WARNS=$((DOCTOR_WARNS + 1)); printf '%s\n' "${yellow}WARN${nc} $*"; }
-doctor_fail() { DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); printf '%s\n' "${red}FAIL${nc} $*"; }
+doctor_section() {
+  if [ "${DOCTOR_JSON_MODE}" = "1" ]; then
+    DOCTOR_CURRENT_SECTION="$1"
+  else
+    printf '\n%s\n' "$1"
+  fi
+}
+doctor_ok() {
+  if [ "${DOCTOR_JSON_MODE}" = "1" ]; then
+    DOCTOR_JSON_CHECKS+=("$(jq -n --arg s "${DOCTOR_CURRENT_SECTION}" --arg m "$*" \
+      '{"section":$s,"status":"ok","message":$m}')")
+  else
+    printf '%s\n' "${green}OK${nc}   $*"
+  fi
+}
+doctor_warn() {
+  DOCTOR_WARNS=$((DOCTOR_WARNS + 1))
+  if [ "${DOCTOR_JSON_MODE}" = "1" ]; then
+    DOCTOR_JSON_CHECKS+=("$(jq -n --arg s "${DOCTOR_CURRENT_SECTION}" --arg m "$*" \
+      '{"section":$s,"status":"warn","message":$m}')")
+  else
+    printf '%s\n' "${yellow}WARN${nc} $*"
+  fi
+}
+doctor_fail() {
+  DOCTOR_FAILS=$((DOCTOR_FAILS + 1))
+  if [ "${DOCTOR_JSON_MODE}" = "1" ]; then
+    DOCTOR_JSON_CHECKS+=("$(jq -n --arg s "${DOCTOR_CURRENT_SECTION}" --arg m "$*" \
+      '{"section":$s,"status":"fail","message":$m}')")
+  else
+    printf '%s\n' "${red}FAIL${nc} $*"
+  fi
+}
 
 doctor_require_command() {
   local cmd="$1"
@@ -2393,7 +2693,7 @@ doctor_deployments_available() {
 }
 
 doctor_check_host() {
-  printf '\nHost\n'
+  doctor_section "Host"
   [ "$(uname -s)" = "Linux" ] && doctor_ok "host OS is Linux" || doctor_fail "host OS is not Linux"
   [ "$(uname -m)" = "x86_64" ] && doctor_ok "architecture is x86_64" || doctor_fail "architecture is not x86_64"
   if awk '/^flags[ \t]*:/ && /(^| )avx2( |$)/ {found=1} END {exit found ? 0 : 1}' /proc/cpuinfo; then
@@ -2426,7 +2726,7 @@ doctor_check_host() {
 }
 
 doctor_check_cluster() {
-  printf '\nCluster\n'
+  doctor_section "Cluster"
   local nodes not_ready bad_pods
   if ! nodes="$(run_kubectl get nodes --no-headers 2>/dev/null)"; then
     doctor_fail "cannot query Kubernetes nodes"
@@ -2453,7 +2753,7 @@ doctor_check_cluster() {
 }
 
 doctor_check_battlegroup() {
-  printf '\nBattlegroup\n'
+  doctor_section "Battlegroup"
   local ns bg title phase stopped status backups latest_backup backup_age_hours max_age_hours mode_bad token_count rmq_port director_port pghero_port pod_name pod_dns search_extra
   if ! ns="$(single_battlegroup_namespace 2>/dev/null)"; then
     doctor_warn "no single battlegroup namespace found"
@@ -2534,10 +2834,31 @@ doctor_check_battlegroup() {
   else
     doctor_warn "no database backups found in ${backups}; run: $0 backup"
   fi
+
+  local bgd_pod declare_total declare_empty declare_populated
+  bgd_pod="$(run_kubectl get pods -n "${ns}" -l role=igw-battlegroup-director \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [ -n "${bgd_pod}" ]; then
+    declare_total="$(run_kubectl logs -n "${ns}" "${bgd_pod}" 2>/dev/null \
+      | grep -c "DeclareBattlegroupUpdates" || echo 0)"
+    declare_empty="$(run_kubectl logs -n "${ns}" "${bgd_pod}" 2>/dev/null \
+      | grep "DeclareBattlegroupUpdates" \
+      | grep -c 'UpDeclarationsByPartitionId":{}' || echo 0)"
+    declare_populated=$(( declare_total - declare_empty ))
+    if [ "${declare_populated}" -gt 0 ]; then
+      doctor_ok "BGD has fired ${declare_populated} populated DeclareBattlegroupUpdates — server should be visible in browser"
+    elif [ "${declare_total}" -gt 0 ]; then
+      doctor_warn "BGD fired ${declare_total} DeclareBattlegroupUpdates but all had empty payloads — server not visible; check --node-external-ip and game pod readiness"
+    else
+      doctor_warn "no DeclareBattlegroupUpdates in BGD logs — possible build skew; run: $0 update"
+    fi
+  else
+    doctor_warn "BGD pod not found; cannot check browser visibility"
+  fi
 }
 
 doctor_check_backup_timer() {
-  printf '\nScheduled Backups\n'
+  doctor_section "Scheduled Backups"
   if as_root systemctl list-unit-files "$(basename "${BACKUP_TIMER}")" --no-legend 2>/dev/null | awk 'NF {found=1} END {exit found ? 0 : 1}'; then
     doctor_ok "backup timer unit is installed"
     if as_root systemctl is-enabled --quiet "$(basename "${BACKUP_TIMER}")"; then
@@ -2559,7 +2880,7 @@ doctor_check_backup_timer() {
 }
 
 doctor_check_firewall() {
-  printf '\nFirewall And Admin Exposure\n'
+  doctor_section "Firewall And Admin Exposure"
   load_firewall_env
 
   local firewall_summary exposed port label listeners cidrs firewall_active
@@ -2603,6 +2924,23 @@ doctor_check_firewall() {
   fi
 
   doctor_ok "player-facing ports to allow are $(public_surface_ports | awk -F '\t' '{print $1}' | join_csv)"
+}
+
+doctor_check_manager_service() {
+  as_root test -f "${MANAGER_SERVICE_UNIT}" || return 0
+  doctor_section "Manager Service"
+  local port
+  port="$(as_root awk -F= '/^DUNE_DASHBOARD_PORT=/{print $2; exit}' "${MANAGER_SERVICE_ENV}" 2>/dev/null || echo 29187)"
+  if as_root systemctl is-active --quiet "$(basename "${MANAGER_SERVICE_UNIT}")"; then
+    doctor_ok "dune-server-service is active"
+  else
+    doctor_fail "dune-server-service is installed but not active; run: systemctl start dune-server-service"
+  fi
+  if curl -sf --max-time 3 "http://localhost:${port}/api/cluster" >/dev/null 2>&1; then
+    doctor_ok "dune-server-service HTTP API is reachable on port ${port}"
+  else
+    doctor_warn "dune-server-service HTTP API is not responding on port ${port}; service may still be starting"
+  fi
 }
 
 shell_quote() {
@@ -2651,7 +2989,7 @@ external_udp_nmap_status() {
 }
 
 doctor_check_external_reachability() {
-  printf '\nExternal Reachability\n'
+  doctor_section "External Reachability"
   local host target timeout detected_public rmq_port udp_status
   host="$(player_facing_host)"
   target="${DUNE_EXTERNAL_PROBE_SSH:-}"
@@ -2718,12 +3056,16 @@ doctor_check_external_reachability() {
 doctor_native() {
   DOCTOR_FAILS=0
   DOCTOR_WARNS=0
+  DOCTOR_JSON_MODE=0
+  DOCTOR_JSON_CHECKS=()
+  DOCTOR_CURRENT_SECTION=""
   local external_check="${DUNE_DOCTOR_EXTERNAL_CHECK:-0}"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --external) external_check=1; shift ;;
+      --json) DOCTOR_JSON_MODE=1; shift ;;
       --help|-h)
-        printf 'Usage: %s doctor [--external]\n' "$0"
+        printf 'Usage: %s doctor [--external] [--json]\n' "$0"
         return 0
         ;;
       *) die "Unknown doctor option: $1" ;;
@@ -2731,14 +3073,29 @@ doctor_native() {
   done
   load_backup_env
   load_firewall_env
-  printf 'Dune native server doctor\n'
+  [ "${DOCTOR_JSON_MODE}" = "0" ] && printf 'Dune native server doctor\n'
   doctor_check_host
   doctor_check_cluster
   doctor_check_battlegroup
   doctor_check_backup_timer
   doctor_check_firewall
+  doctor_check_manager_service
   [ "${external_check}" = "1" ] && doctor_check_external_reachability
-  printf '\nSummary: %d failure(s), %d warning(s)\n' "${DOCTOR_FAILS}" "${DOCTOR_WARNS}"
+  if [ "${DOCTOR_JSON_MODE}" = "1" ]; then
+    local checks_json
+    if [ "${#DOCTOR_JSON_CHECKS[@]}" -gt 0 ]; then
+      checks_json="$(printf '%s\n' "${DOCTOR_JSON_CHECKS[@]}" | jq -s '.')"
+    else
+      checks_json="[]"
+    fi
+    jq -n \
+      --argjson fails "${DOCTOR_FAILS}" \
+      --argjson warns "${DOCTOR_WARNS}" \
+      --argjson checks "${checks_json}" \
+      '{"summary":{"failures":$fails,"warnings":$warns},"checks":$checks}'
+  else
+    printf '\nSummary: %d failure(s), %d warning(s)\n' "${DOCTOR_FAILS}" "${DOCTOR_WARNS}"
+  fi
   [ "${DOCTOR_FAILS}" -eq 0 ]
 }
 
@@ -2946,6 +3303,18 @@ main() {
       ;;
     restore-latest)
       restore_latest
+      ;;
+    apply-canonical)
+      if ! is_root; then exec sudo -E bash "$0" apply-canonical "$@"; fi
+      apply_canonical "$@"
+      ;;
+    install-manager-service)
+      if ! is_root; then exec sudo -E bash "$0" install-manager-service "$@"; fi
+      install_manager_service "$@"
+      ;;
+    uninstall-manager-service)
+      if ! is_root; then exec sudo -E bash "$0" uninstall-manager-service "$@"; fi
+      uninstall_manager_service
       ;;
     k3s-start)
       as_root systemctl start k3s

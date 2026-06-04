@@ -121,9 +121,36 @@ if [ "${1:-}" = "get" ] && [ "${2:-}" = "svc" ] && [[ "$*" == *"-o json"* ]]; th
 JSON
   exit 0
 fi
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "pvc" ] && [[ "$*" == *"-l role=igw-server"* ]]; then
+  printf 'sh-test-server-pvc\n'
+  exit 0
+fi
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "pvc" ] && [ "${3:-}" = "sh-test-server-pvc" ]; then
+  printf 'pv-sh-test-server\n'
+  exit 0
+fi
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "pv" ]; then
+  printf '%s\n' "${DUNE_NATIVE_TEST_ROOT}/var/lib/rancher/k3s/storage/pvc-test"
+  exit 0
+fi
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "igwbg" ] && [[ "$*" == *"-o json"* ]]; then
+  cat <<'JSON'
+{"spec":{"serverGroup":{"template":{"spec":{"sets":[
+  {"map":"Survival_1","resources":{"limits":{"memory":"12Gi"}},"dedicatedScaling":false},
+  {"map":"Overmap","resources":{"limits":{"memory":"2Gi"}},"dedicatedScaling":false},
+  {"map":"DeepDesert_1","resources":{"limits":{"memory":"15Gi"}},"dedicatedScaling":true}
+]}}}}}
+JSON
+  exit 0
+fi
+if [ "${1:-}" = "patch" ] && [ "${2:-}" = "igwbg" ]; then
+  exit 0
+fi
 exit 0
 ''',
     )
+
+    write_executable(bin_dir / "systemd-tmpfiles", common_header + "exit 0\n")
 
     write_executable(
         bin_dir / "ss",
@@ -379,6 +406,128 @@ def test_teardown_yes_removes_owned_state_but_preserves_unrelated_files(tmp_path
     assert unrelated.read_text() == "keep"
     assert off_host_backup.read_text() == "keep"
     assert "userdel -r testdune" in log.read_text()
+
+
+def test_install_containerd_symlink_creates_tmpfiles_conf(tmp_path):
+    env, _log = make_harness(tmp_path)
+    result = source_script_and_run("install_containerd_socket_symlink", env)
+    assert result.returncode == 0, result.stderr
+    conf = tmp_path / "root" / "etc" / "tmpfiles.d" / "k3s-containerd-symlink.conf"
+    assert conf.exists(), f"tmpfiles.d conf not created: {conf}"
+    assert "L /run/containerd /run/k3s/containerd" in conf.read_text()
+
+
+def test_teardown_yes_removes_containerd_symlink_conf(tmp_path):
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+    conf = root / "etc" / "tmpfiles.d" / "k3s-containerd-symlink.conf"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("L /run/containerd /run/k3s/containerd\n")
+
+    result = run_script(["teardown", "--yes"], env)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert not conf.exists(), "containerd symlink conf was not removed by teardown"
+
+
+def test_apply_canonical_sets_sietch_name(tmp_path):
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+    usersettings = (
+        root
+        / "var/lib/rancher/k3s/storage/pvc-test/Saved/UserSettings"
+    )
+    usersettings.mkdir(parents=True)
+    (usersettings / "UserEngine.ini").write_text(
+        "[ConsoleVariables]\n;Bgd.ServerDisplayName=\"placeholder\"\n"
+    )
+    (usersettings / "UserGame.ini").write_text(
+        "[/Script/DuneSandbox.PvpPveSettings]\nm_bShouldForceEnablePvpOnAllPartitions=False\n"
+    )
+
+    result = run_script(
+        ["apply-canonical", "--sietch-name", "Test Sietch", "--no-stop"], env
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    engine_ini = (usersettings / "UserEngine.ini").read_text()
+    assert 'Bgd.ServerDisplayName="Test Sietch"' in engine_ini
+
+
+def test_apply_canonical_sets_pvp_partition(tmp_path):
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+    usersettings = (
+        root
+        / "var/lib/rancher/k3s/storage/pvc-test/Saved/UserSettings"
+    )
+    usersettings.mkdir(parents=True)
+    (usersettings / "UserEngine.ini").write_text("[ConsoleVariables]\n")
+    (usersettings / "UserGame.ini").write_text(
+        "[/Script/DuneSandbox.PvpPveSettings]\nm_bShouldForceEnablePvpOnAllPartitions=False\n"
+    )
+
+    result = run_script(
+        ["apply-canonical", "--pvp-partition", "8", "--no-stop"], env
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    game_ini = (usersettings / "UserGame.ini").read_text()
+    assert "+m_PvpEnabledPartitions=8" in game_ini
+
+
+def test_apply_canonical_idempotent_sietch_name(tmp_path):
+    """Running apply-canonical twice should not duplicate the display name."""
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+    usersettings = (
+        root
+        / "var/lib/rancher/k3s/storage/pvc-test/Saved/UserSettings"
+    )
+    usersettings.mkdir(parents=True)
+    (usersettings / "UserEngine.ini").write_text("[ConsoleVariables]\n")
+    (usersettings / "UserGame.ini").write_text(
+        "[/Script/DuneSandbox.PvpPveSettings]\n"
+    )
+
+    for _ in range(2):
+        result = run_script(
+            ["apply-canonical", "--sietch-name", "My Sietch", "--no-stop"], env
+        )
+        assert result.returncode == 0, result.stderr
+
+    engine_ini = (usersettings / "UserEngine.ini").read_text()
+    assert engine_ini.count('Bgd.ServerDisplayName=') == 1
+
+
+def test_doctor_json_produces_valid_json_with_expected_shape(tmp_path):
+    """doctor --json must emit valid JSON with summary + checks array regardless of check outcomes."""
+    import json
+
+    env, _log = make_harness(tmp_path)
+    result = run_script(["doctor", "--json"], env)
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"doctor --json output is not valid JSON: {exc}\nstdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+        )
+
+    assert "summary" in data, "missing top-level 'summary' key"
+    assert "failures" in data["summary"]
+    assert "warnings" in data["summary"]
+    assert isinstance(data["summary"]["failures"], int)
+    assert isinstance(data["summary"]["warnings"], int)
+
+    assert "checks" in data, "missing top-level 'checks' key"
+    assert isinstance(data["checks"], list)
+
+    for check in data["checks"]:
+        assert "section" in check, f"check missing 'section': {check}"
+        assert "status" in check, f"check missing 'status': {check}"
+        assert check["status"] in ("ok", "warn", "fail"), f"unexpected status: {check['status']}"
+        assert "message" in check, f"check missing 'message': {check}"
+
+    # Verify no colored ANSI escape codes leaked into JSON output
+    assert "\033[" not in result.stdout, "ANSI escape codes found in JSON output"
 
 
 def test_teardown_keep_flags_preserve_user_and_funcom_artifacts(tmp_path):
