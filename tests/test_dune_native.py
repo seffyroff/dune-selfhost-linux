@@ -4,6 +4,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "linux" / "dune-native.sh"
@@ -151,6 +153,19 @@ exit 0
     )
 
     write_executable(bin_dir / "systemd-tmpfiles", common_header + "exit 0\n")
+
+    write_executable(
+        bin_dir / "curl",
+        common_header
+        + r"""
+if [[ "$*" == *"api.github.com"* ]]; then
+  printf '{"tag_name":"v0.3.15","assets":[{"name":"dune-server-service","browser_download_url":"https://fake.example.com/binary"}]}\n'
+  exit 0
+fi
+printf '#!/bin/sh\necho fake-dune-server-service\n'
+exit 0
+""",
+    )
 
     write_executable(
         bin_dir / "ss",
@@ -389,6 +404,9 @@ def test_teardown_yes_removes_owned_state_but_preserves_unrelated_files(tmp_path
         root / "var" / "lib" / "rancher" / "k3s" / "state": "state",
         root / "etc" / "rancher" / "k3s" / "config.yaml": "config",
         root / "run" / "k3s" / "state": "run",
+        root / "etc" / "systemd" / "system" / "dune-server-service.service": "unit",
+        root / "etc" / "dune-server-service.env": "env",
+        root / "opt" / "dune-server-service" / "dune-server-service": "binary",
     }
     for path, content in files_to_remove.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -528,6 +546,70 @@ def test_doctor_json_produces_valid_json_with_expected_shape(tmp_path):
 
     # Verify no colored ANSI escape codes leaked into JSON output
     assert "\033[" not in result.stdout, "ANSI escape codes found in JSON output"
+
+
+def test_apply_canonical_patches_memory_limit_via_kubectl(tmp_path):
+    env, log = make_harness(tmp_path)
+    root = tmp_path / "root"
+    usersettings = root / "var/lib/rancher/k3s/storage/pvc-test/Saved/UserSettings"
+    usersettings.mkdir(parents=True)
+    (usersettings / "UserEngine.ini").write_text("[ConsoleVariables]\n")
+    (usersettings / "UserGame.ini").write_text("[/Script/DuneSandbox.PvpPveSettings]\n")
+
+    result = run_script(
+        ["apply-canonical", "--mem-survival", "24Gi", "--no-stop"], env
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+    commands = log.read_text()
+    assert "patch igwbg" in commands, f"kubectl patch igwbg not called;\ncommands:\n{commands}"
+    assert "24Gi" in commands, f"memory value not in kubectl patch call;\ncommands:\n{commands}"
+
+
+def test_install_manager_service_creates_unit_and_env(tmp_path):
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+
+    result = run_script(
+        ["install-manager-service", "--port", "29187", "--timezone", "Europe/London"],
+        env,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+    unit = root / "etc" / "systemd" / "system" / "dune-server-service.service"
+    assert unit.exists(), "systemd unit not created"
+    unit_text = unit.read_text()
+    assert "ExecStart=" in unit_text
+    assert "dune-server-service" in unit_text
+    assert "WantedBy=multi-user.target" in unit_text
+
+    env_file = root / "etc" / "dune-server-service.env"
+    assert env_file.exists(), "env file not created"
+    env_text = env_file.read_text()
+    assert "DUNE_DASHBOARD_PORT=29187" in env_text
+    assert "DUNE_SERVICE_TIME_ZONE=Europe/London" in env_text
+
+    binary = root / "opt" / "dune-server-service" / "dune-server-service"
+    assert binary.exists(), "binary not created"
+    assert binary.stat().st_mode & stat.S_IXUSR, "binary not executable"
+
+
+def test_uninstall_manager_service_removes_artifacts(tmp_path):
+    env, _log = make_harness(tmp_path)
+    root = tmp_path / "root"
+
+    unit = root / "etc" / "systemd" / "system" / "dune-server-service.service"
+    env_file = root / "etc" / "dune-server-service.env"
+    binary = root / "opt" / "dune-server-service" / "dune-server-service"
+    for path in (unit, env_file, binary):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("content")
+
+    result = run_script(["uninstall-manager-service"], env)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert not unit.exists(), "unit file not removed"
+    assert not env_file.exists(), "env file not removed"
+    assert not binary.exists(), "binary not removed"
 
 
 def test_teardown_keep_flags_preserve_user_and_funcom_artifacts(tmp_path):

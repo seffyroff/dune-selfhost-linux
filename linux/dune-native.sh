@@ -2116,12 +2116,13 @@ install_manager_service() {
 
   local ns
   ns="$(single_battlegroup_namespace 2>/dev/null || true)"
+  as_root install -d -m 0755 "$(dirname "${MANAGER_SERVICE_ENV}")"
   {
     printf 'DUNE_DASHBOARD_PORT=%s\n' "${port}"
     printf 'DUNE_SERVICE_HOME=%s\n' "${DUNE_HOME}"
     printf 'DUNE_SERVICE_TIME_ZONE=%s\n' "${timezone}"
-    [ -n "${ns}" ] && printf 'DUNE_NAMESPACE=%s\n' "${ns}"
-    [ -n "${auth_token_file}" ] && printf 'DUNE_COMMAND_AUTH_TOKEN_FILE=%s\n' "${auth_token_file}"
+    [ -z "${ns}" ] || printf 'DUNE_NAMESPACE=%s\n' "${ns}"
+    [ -z "${auth_token_file}" ] || printf 'DUNE_COMMAND_AUTH_TOKEN_FILE=%s\n' "${auth_token_file}"
   } | as_root tee "${MANAGER_SERVICE_ENV}" >/dev/null
   as_root chmod 0640 "${MANAGER_SERVICE_ENV}"
 
