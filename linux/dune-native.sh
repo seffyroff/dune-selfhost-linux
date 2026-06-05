@@ -299,6 +299,18 @@ cd "${STEAMCMD_DIR}"
 exec "${STEAMCMD_DIR}/steamcmd.sh" "\$@"
 EOF
   chmod 0755 "${STEAMCMD_BIN}"
+
+  # The server manager looks for steamcmd at $DUNE_HOME/Steam/steamcmd.sh
+  local steam_compat_wrapper="${DUNE_HOME}/Steam/steamcmd.sh"
+  install -d -m 0755 "${DUNE_HOME}/Steam"
+  cat > "${steam_compat_wrapper}" <<EOF
+#!/usr/bin/env bash
+exec "${STEAMCMD_DIR}/steamcmd.sh" "\$@"
+EOF
+  chmod 0755 "${steam_compat_wrapper}"
+  if id "${DUNE_USER}" >/dev/null 2>&1; then
+    chown "${DUNE_USER}:${DUNE_USER}" "${DUNE_HOME}/Steam" "${steam_compat_wrapper}"
+  fi
 }
 
 install_openrc_compat_wrappers() {
