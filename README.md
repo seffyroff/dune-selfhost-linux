@@ -1,7 +1,6 @@
 # Dune Self-Hosted Linux
 
-CURRENT STATUS: Server starts up correctly, but never appears in server browser
-
+CURRENT STATUS: Everything works, server stable.  Additional functionality added to work with https://github.com/adainrivers/dune-dedicated-server-manager
 Linux-native tooling for running the Dune: Awakening self-hosted server
 distribution without the packaged Windows Hyper-V VM.
 
